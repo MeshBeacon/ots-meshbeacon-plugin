@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ots-meshbeacon-bridge"
-version = "1.0.1"
+version = "1.0.2"
 description = "OpenTAKServer plugin bridging MeshBeacon Duck telemetry over an encrypted MQTT link"
 authors = ["OpenTAKServer <zaihan@meshbeacon.org>"]
 readme = "README.md"

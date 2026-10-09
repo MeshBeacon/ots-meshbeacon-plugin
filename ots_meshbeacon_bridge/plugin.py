@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import socket
 import threading
 import traceback
@@ -302,7 +303,13 @@ class MeshBeaconPlugin(Plugin):
         detail = event.find("detail")
         if detail is None:
             return
-        chatgrp = detail.find("chatgrp")
+        # <chatgrp> is nested inside <__chat>, not a direct child of
+        # <detail> (see this file's own _build_geochat_cot() for the same
+        # shape) -- ElementTree's find() only matches immediate children
+        # for a plain tag name, so a plain detail.find("chatgrp") always
+        # returns None and silently drops every real GeoChat CoT. ".//"
+        # searches all descendants instead.
+        chatgrp = detail.find(".//chatgrp")
         remarks = detail.find("remarks")
         if chatgrp is None or remarks is None or not remarks.text:
             return
@@ -316,8 +323,14 @@ class MeshBeaconPlugin(Plugin):
 
         # A 1:1 DM's chatgrp carries the recipient's uid in a "uidN"
         # attribute (N >= 1); broadcasts to "All Chat Rooms" don't name any
-        # specific EUD here, so they're intentionally not relayed -- only
-        # replies addressed to a specific Duck's contact are.
+        # specific EUD here, so under normal circumstances they're not
+        # relayed -- only replies addressed to a specific Duck's contact
+        # are. In practice though, iTAK is known to never actually transmit
+        # a private 1:1 GeoChat CoT at all (the message only ever appears
+        # in iTAK's own local chat UI, never reaching the server), while
+        # broadcasts to "All Chat Rooms" do transmit reliably. As a
+        # fallback for iTAK operators, a broadcast message starting with
+        # "@<duck_id>" is therefore also treated as a directed reply.
         for attr, uid in chatgrp.attrib.items():
             if not attr.startswith("uid") or attr == "uid0":
                 continue
@@ -325,17 +338,47 @@ class MeshBeaconPlugin(Plugin):
                 continue
 
             duck_id = uid[len("meshbeacon-") :]
-            message = remarks.text
-            sent = self.send_command(duck_id, message)
-            if sent:
-                self._logger.info(
-                    f"MeshBeacon plugin: relayed GeoChat reply to duck_id={duck_id}"
-                )
-            else:
-                self._logger.warning(
-                    f"MeshBeacon plugin: failed to relay GeoChat reply to duck_id={duck_id} "
-                    "(bridge not connected/configured)"
-                )
+            self._relay_geochat_reply(duck_id, remarks.text)
+            return
+
+        mention = re.match(r"^\s*@(\S+)[:,]?\s+(.+)$", remarks.text, re.DOTALL)
+        if mention:
+            duck_id = self._resolve_mentioned_duck(mention.group(1))
+            if duck_id is not None:
+                self._relay_geochat_reply(duck_id, mention.group(2))
+
+    def _resolve_mentioned_duck(self, candidate: str) -> str | None:
+        """
+        Case-insensitively resolves an "@name" mention typed in a broadcast
+        GeoChat to the exact duck_id this plugin registered the Duck's EUD
+        under, or None if no registered Duck matches. Avoids silently
+        relaying commands to a typo'd or nonexistent duck_id.
+        """
+        from opentakserver.extensions import db
+        from opentakserver.models.EUD import EUD
+
+        wanted = f"meshbeacon-{candidate}".lower()
+        with self._app.app_context():
+            euds = db.session.execute(
+                db.session.query(EUD).filter(EUD.uid.like("meshbeacon-%"))
+            ).all()
+            for row in euds:
+                eud = row[0]
+                if eud.uid.lower() == wanted:
+                    return eud.uid[len("meshbeacon-") :]
+        return None
+
+    def _relay_geochat_reply(self, duck_id: str, message: str) -> None:
+        sent = self.send_command(duck_id, message)
+        if sent:
+            self._logger.info(
+                f"MeshBeacon plugin: relayed GeoChat reply to duck_id={duck_id}"
+            )
+        else:
+            self._logger.warning(
+                f"MeshBeacon plugin: failed to relay GeoChat reply to duck_id={duck_id} "
+                "(bridge not connected/configured)"
+            )
 
     # -- CoT delivery ---------------------------------------------------
 
@@ -428,7 +471,7 @@ class MeshBeaconPlugin(Plugin):
 
     # -- MeshBeacon event -> CoT --------------------------------------------
 
-    def _ensure_eud(self, uid: str) -> None:
+    def _ensure_eud(self, uid: str, duck_id: str) -> None:
         """
         Registers a minimal EUD row for this Duck if one doesn't already
         exist. Real ATAK/WinTAK/iTAK clients get an EUD row created by
@@ -440,6 +483,17 @@ class MeshBeaconPlugin(Plugin):
         save -- never appearing in OTS's Alerts UI (CoT/Point rows for the
         same uid also silently fail to insert, per cot_parser.insert_cot's
         own IntegrityError handling).
+
+        `callsign` is set to the duck_id here: unlike the marker/CoT path
+        (where the live <contact callsign="duck_id"> is enough for ATAK to
+        label the marker), ATAK/WinTAK/iTAK's *Contacts* list -- the thing
+        an operator browses to start a private DM -- comes from OTS's
+        `/Marti/api/contacts/all`, which serves `EUD.callsign` straight out
+        of this table, not anything derived from CoT. Leaving it null (as
+        this used to) means every Duck shows up with a blank callsign in
+        the Contacts list, making it effectively impossible for an operator
+        to find and privately DM it -- GeoChat replies addressed to "" are
+        never seen by `_on_geochat_message` either way.
         """
         from opentakserver.extensions import db
         from opentakserver.models.EUD import EUD
@@ -447,25 +501,63 @@ class MeshBeaconPlugin(Plugin):
         with self._app.app_context():
             existing = db.session.execute(db.session.query(EUD).filter_by(uid=uid)).first()
             if existing:
-                self._logger.debug(f"MeshBeacon plugin: EUD {uid} already registered")
+                eud = existing[0]
+                if not eud.callsign:
+                    # Upgrade a row created before this fix, so Ducks
+                    # registered under the old code eventually become
+                    # DM-able too, without needing a manual DB fix.
+                    self._set_callsign(db, eud, duck_id)
+                else:
+                    self._logger.debug(f"MeshBeacon plugin: EUD {uid} already registered")
                 return
 
             eud = EUD()
             eud.uid = uid
-            # Leave callsign unset: EUD.callsign is unique, and the CoT's
-            # own <contact callsign="duck_id"> already supplies the
-            # display name in ATAK regardless of this table.
             eud.device = "MeshBeacon Duck"
             eud.os = "MeshBeacon"
             eud.platform = "MeshBeacon"
 
             try:
                 db.session.add(eud)
+                db.session.flush()
+                self._set_callsign(db, eud, duck_id, commit=False)
                 db.session.commit()
                 self._logger.info(f"MeshBeacon plugin: registered new EUD {uid}")
             except sqlalchemy.exc.IntegrityError as e:
                 # Lost a race with another thread inserting the same uid
                 self._logger.debug(f"MeshBeacon plugin: EUD {uid} insert raced, rolling back: {e}")
+                db.session.rollback()
+
+    def _set_callsign(self, db, eud, duck_id: str, commit: bool = True) -> None:
+        """
+        EUD.callsign is unique, so a human operator's device (or another
+        Duck re-using a callsign some other EUD already took) could
+        collide with the bare duck_id -- fall back to a disambiguated
+        callsign rather than letting the whole EUD registration fail and
+        leaving the Duck permanently un-DM-able.
+        """
+        candidate = duck_id
+        suffix = 2
+        while True:
+            conflict = db.session.execute(
+                db.session.query(eud.__class__)
+                .filter_by(callsign=candidate)
+                .filter(eud.__class__.uid != eud.uid)
+            ).first()
+            if not conflict:
+                break
+            candidate = f"{duck_id}-{suffix}"
+            suffix += 1
+
+        eud.callsign = candidate
+        if commit:
+            try:
+                db.session.commit()
+                self._logger.info(
+                    f"MeshBeacon plugin: set callsign={candidate!r} for EUD {eud.uid}"
+                )
+            except sqlalchemy.exc.IntegrityError as e:
+                self._logger.debug(f"MeshBeacon plugin: callsign update raced, rolling back: {e}")
                 db.session.rollback()
 
     def _forward_to_ots(self, data: dict) -> None:
@@ -495,7 +587,7 @@ class MeshBeaconPlugin(Plugin):
         )
 
         try:
-            self._ensure_eud(f"meshbeacon-{duck_id}")
+            self._ensure_eud(f"meshbeacon-{duck_id}", duck_id)
         except BaseException as e:
             self._logger.error(f"MeshBeacon plugin: failed to register EUD for {duck_id}: {e}")
             self._logger.debug(traceback.format_exc())

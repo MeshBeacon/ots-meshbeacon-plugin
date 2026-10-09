@@ -24,9 +24,13 @@ guide.
    `cot_parser` RabbitMQ exchange (the same one `EudHandler` and the
    Meshtastic controller publish every parsed CoT event to) and watches for
    outgoing GeoChat events (`b-t-f`) addressed to a `meshbeacon-<duck_id>`
-   contact, forwarding the message text through step 3 above. Only 1:1 DMs
-   to a specific Duck are relayed this way -- broadcasts to "All Chat
-   Rooms" are not, to avoid spamming every Duck on the mesh.
+   contact, forwarding the message text through step 3 above.
+5. As a fallback for clients where a private 1:1 DM isn't an option (see
+   "Replying to a Duck" below), a broadcast message in "All Chat Rooms"
+   starting with `@<duck_id>` is also relayed the same way, once the
+   mentioned name is matched case-insensitively against a registered Duck
+   EUD. Any other broadcast text is ignored, to avoid spamming every Duck
+   on the mesh.
 
 ## Replying to a Duck -- read this before an incident
 
@@ -38,13 +42,14 @@ it's routed to a pre-selected recipient. (A dedicated SOS still raises a
 real OTS Alert independently of chat, so an emergency doesn't depend on
 someone noticing the broadcast.)
 
-**But replying only works from a direct 1:1 chat with that Duck's contact,
-not by typing in "All Chat Rooms".** The plugin's GeoChat relay (item 4
-above) only watches for private DMs addressed to the Duck's
+**Replying by default only works from a direct 1:1 chat with that Duck's
+contact, not by typing in "All Chat Rooms".** The plugin's GeoChat relay
+normally only watches for private DMs addressed to the Duck's
 `meshbeacon-<duck_id>` contact -- a reply typed inline in the broadcast
-room is never seen by the relay and will silently never reach the Duck.
+room is otherwise never seen by the relay and will silently never reach
+the Duck.
 
-To reply to a Duck from ATAK/WinTAK/iTAK:
+To reply to a Duck from ATAK/WinTAK:
 
 1. Open the **Contacts** list (not the "All Chat Rooms" tab).
 2. Find the Duck (it appears as an EUD contact using its `duck_id` as the
@@ -52,10 +57,27 @@ To reply to a Duck from ATAK/WinTAK/iTAK:
 3. Start a **direct/private chat** with that contact and send the message
    there.
 
+**iTAK is a known exception: its private 1:1 chat does not reliably
+transmit at all.** A message typed into a 1:1 DM shows as "sent" in
+iTAK's own local chat UI, but no GeoChat CoT is ever actually put on the
+wire -- confirmed by inspecting OTS's raw `eud_handler` socket logs around
+a private DM send and finding no `b-t-f` event, only the client's routine
+position pings. Broadcasts to "All Chat Rooms" transmit fine from iTAK,
+so iTAK operators should instead reply in **"All Chat Rooms"** with the
+message prefixed by an `@` mention of the Duck's callsign, e.g.:
+
+```
+@MUHAMMAD on our way, hold position
+```
+
+The plugin matches `@<name>` case-insensitively against registered Duck
+EUDs and relays only the text after the mention; any other broadcast text
+is left alone.
+
 If your operators aren't used to this distinction, prefer sending replies
 through the admin `/api/meshbeacon/command` route (or a dashboard button
-that calls it) instead of training everyone on the DM-vs-broadcast
-convention under stress.
+that calls it) instead of training everyone on the DM-vs-broadcast-vs-
+`@mention` convention under stress.
 
 ## Encryption
 
